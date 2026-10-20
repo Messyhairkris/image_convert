@@ -1,0 +1,37 @@
+[package]
+name = "photo_tools"
+version = "0.1.0"
+edition = "2021"
+description = "Non-AI image effects: line art, flat-colour SVG, pencil sketch, dither, halftone, hatching and ASCII art."
+publish = false
+
+[lib]
+name = "photo_tools"
+path = "src/lib.rs"
+
+# The command-line tool. Programs that embed the library turn the `cli` feature off
+# (default-features = false) and never compile clap.
+[[bin]]
+name = "photo_tools"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+imageproc = { version = "0.27.0", default-features = false }
+clap = { version = "4.6.7", features = ["derive"], optional = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Pixel loops are slow unoptimised; keep debug builds and tests usable.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
