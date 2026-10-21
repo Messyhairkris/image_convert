@@ -44,7 +44,8 @@ build output on a local disk: set `CARGO_TARGET_DIR` (for example to
 - No key replaces the selection, **Shift** adds to it, **Ctrl** removes from it. With
   nothing selected the whole photo is used; Ctrl+D goes back to the whole photo.
 - Choose a mode on the left (line art, vector, or an effect) - the result renders as you
-  change things. **Tab** flips between the photo and the result.
+  change things. **V** flips between the photo and the result. **Auto** picks settings
+  for this photo (inside the selection, if any); **Reset** goes back to the defaults.
 - **Eraser (E)**: paint over the result to remove parts of it.
 - Ctrl+Z / Ctrl+Y undo and redo every selection and erase step. Wheel zooms, middle drag
   or Space+drag pans, F fits the photo to the window.

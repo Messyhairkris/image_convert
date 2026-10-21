@@ -29,6 +29,44 @@ use photo_tools::{
 /// Textures larger than this on a side are shown downscaled (edits stay full size).
 const MAX_TEXTURE: u32 = 8192;
 
+/// Smooth scaling with mipmaps, so a zoomed-out photo is averaged, not sampled.
+const SMOOTH: TextureOptions = TextureOptions {
+    magnification: egui::TextureFilter::Linear,
+    minification: egui::TextureFilter::Linear,
+    wrap_mode: egui::TextureWrapMode::ClampToEdge,
+    mipmap_mode: Some(egui::TextureFilter::Linear),
+};
+
+/// Shrink by `factor`, keeping the darkest opaque pixel of each block (and the block's
+/// highest alpha), so one-pixel lines survive a zoomed-out view.
+fn shrink_dark(rgba: &RgbaImage, factor: u32) -> RgbaImage {
+    let (w, h) = rgba.dimensions();
+    let (sw, sh) = (w.div_ceil(factor).max(1), h.div_ceil(factor).max(1));
+    RgbaImage::from_fn(sw, sh, |bx, by| {
+        let (mut best, mut alpha) = (image::Rgba([255, 255, 255, 0]), 0u8);
+        let mut darkest = u32::MAX;
+        for y in by * factor..((by + 1) * factor).min(h) {
+            for x in bx * factor..((bx + 1) * factor).min(w) {
+                let p = rgba.get_pixel(x, y);
+                alpha = alpha.max(p[3]);
+                let v = p[0] as u32 + p[1] as u32 + p[2] as u32;
+                if p[3] > 0 && v < darkest {
+                    darkest = v;
+                    best = *p;
+                }
+            }
+        }
+        best[3] = alpha;
+        best
+    })
+}
+
+/// The share of pixels that are dark (lines), to tell the user when nothing was found.
+fn dark_share(g: &GrayImage) -> f64 {
+    let n = g.as_raw().iter().filter(|&&v| v < 128).count();
+    n as f64 / g.as_raw().len().max(1) as f64
+}
+
 fn main() -> eframe::Result {
     let path = std::env::args().nth(1).map(PathBuf::from);
     let options = eframe::NativeOptions {
@@ -99,13 +137,23 @@ struct App {
     overlay: Option<TextureHandle>,
     mode: Mode,
     lineart: LineArtOptions,
+    /// Canny's low threshold as a share of the high one.
+    continuation: f32,
     vector: VectorOptions,
     effect: EffectOptions,
     stroke: StrokeOptions,
     live: bool,
     render: Option<(String, Render)>,
     result_tex: Option<TextureHandle>,
+    /// The result as pixels (true = line art, shown dark-preserving when zoomed out).
+    result_rgba: Option<(bool, RgbaImage)>,
+    /// The downscale factor the result texture was built for (0 = rebuild).
+    result_factor: u32,
     result_dirty: bool,
+    /// Settings whose render failed; not retried until something changes.
+    failed_key: Option<String>,
+    /// The last render found no lines at all (shown over the picture).
+    empty_result: bool,
     rendering: Option<Work>,
     exporting: Option<Work>,
     changed_at: Instant,
@@ -139,13 +187,18 @@ impl App {
             overlay: None,
             mode: Mode::LineArt,
             lineart: LineArtOptions::default(),
+            continuation: 0.5,
             vector: VectorOptions::default(),
             effect: EffectOptions::default(),
             stroke: StrokeOptions::default(),
             live: true,
             render: None,
             result_tex: None,
+            result_rgba: None,
+            result_factor: 0,
             result_dirty: false,
+            failed_key: None,
+            empty_result: false,
             rendering: None,
             exporting: None,
             changed_at: Instant::now(),
@@ -182,13 +235,15 @@ impl App {
                 let tex = ctx.load_texture(
                     "photo",
                     texture_image(&img.to_rgba8()),
-                    TextureOptions::LINEAR,
+                    SMOOTH,
                 );
                 self.reset_editor();
                 self.loaded = Selection::default();
                 self.seen = None;
                 self.render = None;
                 self.result_tex = None;
+                self.result_rgba = None;
+                self.failed_key = None;
                 self.show_result = false;
                 self.view.fit_next = true;
                 self.status = format!(
@@ -211,7 +266,12 @@ impl App {
                 });
                 self.changed_at = Instant::now();
             }
-            Err(e) => self.error = Some(format!("Could not open {}: {e}", path.display())),
+            Err(e) => {
+                self.error = Some(format!(
+                    "Could not open {}: {e} (PNG, JPEG, WebP, BMP, TIFF and GIF are supported)",
+                    path.display()
+                ))
+            }
         }
     }
 
@@ -380,14 +440,24 @@ impl App {
                 self.rendering = None;
                 match result {
                     Ok(r) => {
+                        self.empty_result = matches!(&r, Render::Raster(g) if dark_share(g) < 0.0002);
+                        self.status = match &r {
+                            Render::Raster(g) if dark_share(g) < 0.0002 => format!(
+                                "Rendered in {:.1} s - but nothing was found at these settings. \
+                                 Press Auto, or lower the threshold.",
+                                took.as_secs_f32()
+                            ),
+                            _ => format!("Rendered in {:.1} s.", took.as_secs_f32()),
+                        };
                         self.render = Some((key, r));
+                        self.failed_key = None;
                         self.result_dirty = true;
                         self.error = None;
-                        self.status = format!("Rendered in {:.1} s.", took.as_secs_f32());
                     }
                     Err(e) => {
-                        // Remember the failure so the same options are not retried in a loop.
-                        self.render = Some((key, Render::Text(String::new())));
+                        // Keep the last good result on screen, and do not retry these
+                        // same settings in a loop.
+                        self.failed_key = Some(key);
                         self.error = Some(e);
                     }
                 }
@@ -412,6 +482,7 @@ impl App {
             && self.photo.is_some()
             && self.rendering.is_none()
             && current != Some(want.as_str())
+            && self.failed_key.as_deref() != Some(want.as_str())
             && quiet
         {
             self.start_render();
@@ -440,35 +511,51 @@ impl App {
                     image::Rgba([0, 0, 0, 150])
                 };
             }
-            ctx.load_texture("overlay", texture_image(&rgba), TextureOptions::NEAREST)
+            ctx.load_texture("overlay", texture_image(&rgba), SMOOTH)
         });
         self.seen = Some(now);
         self.result_dirty = true;
         self.changed_at = Instant::now();
     }
 
+    /// Rebuild the result picture when the render or the selection changed, and its
+    /// on-screen copy when the zoom changed. Line art is 1 pixel wide: a plain
+    /// downscale skips most of those pixels and the result looks white, so a zoomed-out
+    /// view keeps the darkest pixel of each block instead.
     fn refresh_result(&mut self, ctx: &egui::Context) {
-        if !self.result_dirty {
-            return;
+        if self.result_dirty {
+            self.result_dirty = false;
+            self.result_rgba = match &self.render {
+                Some((_, Render::Raster(g))) => {
+                    let la = match &self.keep {
+                        Some(m) => {
+                            composite::keep(g, m).unwrap_or_else(|_| composite::opaque(g))
+                        }
+                        None => composite::opaque(g),
+                    };
+                    Some((
+                        true,
+                        RgbaImage::from_fn(la.width(), la.height(), |x, y| {
+                            let p = la.get_pixel(x, y);
+                            image::Rgba([p[0], p[0], p[0], p[1]])
+                        }),
+                    ))
+                }
+                Some((_, Render::Vector(rgba))) => Some((false, rgba.clone())),
+                _ => None,
+            };
+            self.result_factor = 0;
         }
-        self.result_dirty = false;
-        self.result_tex = match &self.render {
-            Some((_, Render::Raster(g))) => {
-                let la = match &self.keep {
-                    Some(m) => composite::keep(g, m).unwrap_or_else(|_| composite::opaque(g)),
-                    None => composite::opaque(g),
-                };
-                let rgba = RgbaImage::from_fn(la.width(), la.height(), |x, y| {
-                    let p = la.get_pixel(x, y);
-                    image::Rgba([p[0], p[0], p[0], p[1]])
-                });
-                Some(ctx.load_texture("result", texture_image(&rgba), TextureOptions::NEAREST))
-            }
-            Some((_, Render::Vector(rgba))) => {
-                Some(ctx.load_texture("result", texture_image(rgba), TextureOptions::NEAREST))
-            }
-            _ => None,
+        let Some((lines, rgba)) = &self.result_rgba else {
+            self.result_tex = None;
+            return;
         };
+        let factor = if *lines { (1.0 / self.view.zoom).floor().clamp(1.0, 64.0) as u32 } else { 1 };
+        if factor != self.result_factor {
+            self.result_factor = factor;
+            let shown = if factor > 1 { shrink_dark(rgba, factor) } else { rgba.clone() };
+            self.result_tex = Some(ctx.load_texture("result", texture_image(&shown), SMOOTH));
+        }
     }
 
     // -- canvas ---------------------------------------------------------------------------
@@ -579,6 +666,15 @@ impl App {
             if let Some(t) = &self.result_tex {
                 painter.image(t.id(), photo_rect, full_uv, Color32::WHITE);
             }
+            if self.empty_result {
+                painter.text(
+                    canvas.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Nothing found at these settings.\nPress Auto, or lower the line strength / threshold.",
+                    egui::FontId::proportional(20.0),
+                    Color32::from_rgb(200, 60, 40),
+                );
+            }
         } else {
             painter.image(photo.tex.id(), photo_rect, full_uv, Color32::WHITE);
             if let Some(t) = &self.overlay {
@@ -669,7 +765,7 @@ impl App {
                     i.key_pressed(Key::OpenBracket),
                     i.key_pressed(Key::CloseBracket),
                     !cmd && i.key_pressed(Key::F),
-                    i.key_pressed(Key::Tab),
+                    !cmd && i.key_pressed(Key::V),
                 )
             });
         for (pressed, event) in [
@@ -716,11 +812,76 @@ impl App {
         self.loaded.ops.clear();
     }
 
+    /// Settings chosen from the photo (inside the selection, if there is one).
+    /// Line art: the edge strengths of the smoothed photo are measured and the line
+    /// threshold put where about the strongest tenth of them are; the photo's size sets
+    /// the smoothing. Vector and effects scale their sizes with the photo.
+    fn auto_settings(&mut self) {
+        let Some(photo) = &self.photo else { return };
+        let img = &photo.img;
+        let (w, h) = (img.width(), img.height());
+        let long = w.max(h) as f32;
+        match self.mode {
+            Mode::LineArt => {
+                let blur = (long / 1000.0).clamp(0.8, 3.0);
+                let gray = GrayImage::from_raw(
+                    w,
+                    h,
+                    photo_tools::luma::rgb_to_gray(img.to_rgb8().as_raw()),
+                )
+                .expect("one gray byte per pixel");
+                let smooth = imageproc::filter::gaussian_blur_f32(&gray, blur);
+                let mag = photo_tools::sobel::magnitude(smooth.as_raw(), w as usize, h as usize);
+                let mut strong: Vec<u16> = mag
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, &m)| m > 8 && self.keep.as_ref().is_none_or(|k| k.bits()[i]))
+                    .map(|(_, &m)| m)
+                    .collect();
+                if strong.is_empty() {
+                    self.status = "Auto: this area has no edges to find.".into();
+                    return;
+                }
+                strong.sort_unstable();
+                let at = |q: f32| strong[((strong.len() - 1) as f32 * q) as usize] as f32;
+                self.lineart.blur = (blur * 10.0).round() / 10.0;
+                match self.lineart.filter {
+                    EdgeFilter::Canny => {
+                        self.lineart.high = at(0.90).round().max(5.0);
+                        self.continuation = 0.4;
+                        self.lineart.low = (0.4 * self.lineart.high).round();
+                    }
+                    EdgeFilter::Sobel => {
+                        self.lineart.low = at(0.93).round().max(10.0);
+                        self.lineart.high = self.lineart.low;
+                    }
+                }
+            }
+            Mode::Vector => {
+                self.vector.colors = 8;
+                self.vector.smoothness = 1.0;
+                self.vector.speckle = ((w as f32 * h as f32) / 4000.0).clamp(8.0, 5000.0) as u32;
+                self.vector.max_iterations = 20;
+            }
+            Mode::Effect => {
+                self.effect.blur = (long / 200.0).clamp(4.0, 60.0);
+                self.effect.cell = ((long / 300.0) as u32).clamp(4, 32);
+                self.effect.columns = 120;
+            }
+        }
+        self.changed_at = Instant::now();
+        self.show_result = true;
+        self.status = "Auto settings chosen for this photo.".into();
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             if ui.button("Open...").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Images", &["png", "jpg", "jpeg"])
+                    .add_filter(
+                        "Images",
+                        &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "gif"],
+                    )
                     .pick_file()
                 {
                     let ctx = ui.ctx().clone();
@@ -759,7 +920,7 @@ impl App {
             ui.separator();
             ui.selectable_value(&mut self.show_result, false, "Photo");
             ui.selectable_value(&mut self.show_result, true, "Result");
-            ui.label("(Tab)");
+            ui.label("(V)");
             ui.separator();
             if ui.button("Fit (F)").clicked() {
                 self.view.fit_next = true;
@@ -824,40 +985,98 @@ impl App {
                 ui.selectable_value(&mut self.mode, Mode::Effect, "Effect");
             });
         ui.add_space(6.0);
+        // Long sliders: a short one moved hundreds of units per pixel and was unusable.
+        ui.spacing_mut().slider_width = 190.0;
+        ui.horizontal(|ui| {
+            let can = self.photo.is_some();
+            if ui
+                .add_enabled(can, egui::Button::new("Auto"))
+                .on_hover_text("Choose settings for this photo")
+                .clicked()
+            {
+                self.auto_settings();
+            }
+            if ui
+                .add(egui::Button::new("Reset"))
+                .on_hover_text("Back to the default settings for this mode")
+                .clicked()
+            {
+                match self.mode {
+                    Mode::LineArt => {
+                        self.lineart = LineArtOptions::default();
+                        self.continuation = 0.5;
+                        self.stroke = StrokeOptions::default();
+                    }
+                    Mode::Vector => self.vector = VectorOptions::default(),
+                    Mode::Effect => {
+                        self.effect = EffectOptions { style: self.effect.style, ..EffectOptions::default() }
+                    }
+                }
+            }
+        });
+        ui.add_space(4.0);
         match self.mode {
             Mode::LineArt => {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.lineart.filter, EdgeFilter::Canny, "Canny");
                     ui.selectable_value(&mut self.lineart.filter, EdgeFilter::Sobel, "Sobel");
                 });
-                ui.add(egui::Slider::new(&mut self.lineart.blur, 0.0..=10.0).text("blur"));
-                let top = if self.lineart.filter == EdgeFilter::Sobel {
-                    1500.0
-                } else {
-                    500.0
-                };
-                ui.add(egui::Slider::new(&mut self.lineart.low, 0.0..=top).text("threshold low"));
+                ui.add(
+                    egui::Slider::new(&mut self.lineart.blur, 0.0..=6.0)
+                        .step_by(0.1)
+                        .text("smooth first"),
+                )
+                .on_hover_text("Blurs the photo before finding lines: higher = fewer, cleaner lines");
                 if self.lineart.filter == EdgeFilter::Canny {
                     ui.add(
-                        egui::Slider::new(&mut self.lineart.high, 0.0..=top).text("threshold high"),
-                    );
-                    self.lineart.high = self.lineart.high.max(self.lineart.low);
+                        egui::Slider::new(&mut self.lineart.high, 5.0..=400.0)
+                            .logarithmic(true)
+                            .step_by(1.0)
+                            .text("line strength"),
+                    )
+                    .on_hover_text("Only edges this strong start a line: higher = fewer lines");
+                    // Weak edges continue a line when they are at least this share of the
+                    // line strength (Canny's low threshold), kept as a share so moving the
+                    // strength never leaves low above high.
+                    ui.add(
+                        egui::Slider::new(&mut self.continuation, 0.1..=1.0)
+                            .step_by(0.05)
+                            .text("line continuation"),
+                    )
+                    .on_hover_text("Lower = lines run on further through faint edges");
+                    self.lineart.low = (self.continuation * self.lineart.high).round();
+                } else {
+                    ui.add(
+                        egui::Slider::new(&mut self.lineart.low, 10.0..=600.0)
+                            .logarithmic(true)
+                            .step_by(1.0)
+                            .text("threshold"),
+                    )
+                    .on_hover_text("Edges this strong become lines: higher = fewer lines");
+                    self.lineart.high = self.lineart.low;
                 }
                 ui.add_space(6.0);
                 ui.label("SVG export");
-                ui.add(egui::Slider::new(&mut self.stroke.tolerance, 0.0..=10.0).text("smoothing"));
-                ui.add(egui::Slider::new(&mut self.stroke.width, 0.1..=20.0).text("stroke width"));
+                ui.add(egui::Slider::new(&mut self.stroke.tolerance, 0.0..=4.0).step_by(0.1).text("smoothing"));
+                ui.add(egui::Slider::new(&mut self.stroke.width, 0.25..=10.0).logarithmic(true).text("stroke width"));
                 ui.add(
                     egui::Slider::new(&mut self.stroke.min_pixels, 0..=200)
+                        .logarithmic(true)
                         .text("drop specks under"),
                 );
             }
             Mode::Vector => {
-                ui.add(egui::Slider::new(&mut self.vector.colors, 2..=64).text("colours"));
+                ui.add(egui::Slider::new(&mut self.vector.colors, 2..=32).text("colours"));
                 ui.add(
-                    egui::Slider::new(&mut self.vector.smoothness, 0.0..=10.0).text("smoothness"),
+                    egui::Slider::new(&mut self.vector.smoothness, 0.0..=4.0)
+                        .step_by(0.1)
+                        .text("smoothness"),
                 );
-                ui.add(egui::Slider::new(&mut self.vector.speckle, 0..=2000).text("speckle"));
+                ui.add(
+                    egui::Slider::new(&mut self.vector.speckle, 0..=5000)
+                        .logarithmic(true)
+                        .text("merge specks under"),
+                );
                 ui.add(
                     egui::Slider::new(&mut self.vector.max_iterations, 1..=100).text("iterations"),
                 );
@@ -876,7 +1095,11 @@ impl App {
                 });
                 match self.effect.style {
                     Style::Sketch => {
-                        ui.add(egui::Slider::new(&mut self.effect.blur, 0.5..=100.0).text("blur"));
+                        ui.add(
+                            egui::Slider::new(&mut self.effect.blur, 0.5..=100.0)
+                                .logarithmic(true)
+                                .text("blur"),
+                        );
                     }
                     Style::Halftone | Style::Hatch => {
                         ui.add(egui::Slider::new(&mut self.effect.cell, 2..=64).text("cell"));
@@ -977,6 +1200,19 @@ impl eframe::App for App {
                 });
             } else {
                 self.canvas(ui);
+            }
+            // Something is being dragged over the window: say so, so a drop is expected.
+            if ui.input(|i| !i.raw.hovered_files.is_empty()) {
+                let r = ui.max_rect();
+                ui.painter()
+                    .rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(30, 80, 160, 140));
+                ui.painter().text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Drop to open",
+                    egui::FontId::proportional(28.0),
+                    Color32::WHITE,
+                );
             }
         });
         self.refresh_selection(&ctx);
