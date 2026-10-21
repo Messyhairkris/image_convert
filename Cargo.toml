@@ -3,6 +3,7 @@ name = "photo_tools"
 version = "0.2.0"
 edition = "2021"
 description = "Non-AI image effects: line art (PNG or SVG centerlines), flat-colour SVG, pencil sketch, dither, halftone, hatching and ASCII art - for a whole photo or a selected area."
+license = "Unlicense"
 publish = false
 
 [lib]

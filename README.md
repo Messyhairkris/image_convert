@@ -168,3 +168,8 @@ for every module. Each module was then written by a member of the ATLAS crew (sm
 open models) and accepted only when it passed tests it never saw; another member wrote
 independent tests from the contract alone. Who wrote what, and how many attempts it
 took, is in `CREW_RECORD.md`.
+
+## License
+
+Public domain ([The Unlicense](LICENSE)): use, copy, change and ship it in any project, with or without credit.
+
