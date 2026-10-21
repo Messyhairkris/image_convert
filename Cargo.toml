@@ -1,8 +1,8 @@
 [package]
 name = "photo_tools"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Non-AI image effects: line art, flat-colour SVG, pencil sketch, dither, halftone, hatching and ASCII art."
+description = "Non-AI image effects: line art (PNG or SVG centerlines), flat-colour SVG, pencil sketch, dither, halftone, hatching and ASCII art - for a whole photo or a selected area."
 publish = false
 
 [lib]
@@ -16,14 +16,24 @@ name = "photo_tools"
 path = "src/main.rs"
 required-features = ["cli"]
 
+# The editor window: select areas with a lasso, polyline or blob brush, render, erase,
+# export. Built only with `--features gui`, so the library stays free of any UI.
+[[bin]]
+name = "photo_tools_gui"
+path = "src/gui.rs"
+required-features = ["gui"]
+
 [features]
 default = ["cli"]
 cli = ["dep:clap"]
+gui = ["dep:eframe", "dep:rfd"]
 
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 imageproc = { version = "0.27.0", default-features = false }
 clap = { version = "4.6.7", features = ["derive"], optional = true }
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"], optional = true }
+rfd = { version = "0.17.2", optional = true }
 
 [profile.release]
 lto = "thin"
